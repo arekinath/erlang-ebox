@@ -28,3 +28,112 @@
 
 -module(ebox_crypto).
 
+-export([
+    cipher_info/1,
+    one_time/4
+    ]).
+
+cipher_info('chacha20-poly1305') ->
+    #{block_size => 8, key_len => 64, iv_len => 0, auth_len => 16};
+cipher_info('aes128-gcm') ->
+    #{block_size => 16, key_len => 16, iv_len => 12, auth_len => 16};
+cipher_info('aes256-gcm') ->
+    #{block_size => 16, key_len => 32, iv_len => 12, auth_len => 16}.
+
+one_time(Cipher, Key, Data, true) ->
+    one_time(Cipher, Key, Data, #{encrypt => true});
+one_time(Cipher, Key, Data, false) ->
+    one_time(Cipher, Key, Data, #{encrypt => false});
+one_time(Cipher, Key, Data, Opts) when is_list(Opts) ->
+    one_time(Cipher, Key, Data, maps:from_list(Opts));
+one_time('aes128-gcm', Key, Data, #{encrypt := true, iv := IV}) ->
+    {EncData, Ctag} = crypto:crypto_one_time_aead(aes_128_gcm, Key, IV, Data, <<>>, true),
+    <<EncData/binary, Ctag/binary>>;
+one_time('aes128-gcm', Key, Data, #{encrypt := false, iv := IV}) ->
+    <<EncData:(byte_size(Data) - 16)/binary, Ctag:16/binary>> = Data,
+    Res = crypto:crypto_one_time_aead(aes_128_gcm, Key, IV, EncData, <<>>, Ctag, false),
+    case Res of
+        error -> error(bad_mac);
+        _ -> Res
+    end;
+one_time('aes128-gcm', _Key, _Data, Opts = #{encrypt := _}) ->
+    error({badarg, {missing_iv, Opts}});
+one_time('aes256-gcm', Key, Data, #{encrypt := true, iv := IV}) ->
+    {EncData, Ctag} = crypto:crypto_one_time_aead(aes_256_gcm, Key, IV, Data, <<>>, true),
+    <<EncData/binary, Ctag/binary>>;
+one_time('aes256-gcm', Key, Data, #{encrypt := false, iv := IV}) ->
+    <<EncData:(byte_size(Data) - 16)/binary, Ctag:16/binary>> = Data,
+    Res = crypto:crypto_one_time_aead(aes_256_gcm, Key, IV, EncData, <<>>, Ctag, false),
+    case Res of
+        error -> error(bad_mac);
+        _ -> Res
+    end;
+one_time('aes256-gcm', _Key, _Data, Opts = #{encrypt := _}) ->
+    error({badarg, {missing_iv, Opts}});
+one_time('chacha20-poly1305', Key, Data, Opts = #{encrypt := true}) ->
+    Seq = maps:get(seq, Opts, 0),
+    <<K2:32/binary, _K1:32/binary>> = Key,
+
+    IV = <<1:8/little-unit:8, Seq:8/unit:8>>,
+    EncData = crypto:crypto_one_time(chacha20, K2, IV, Data, true),
+
+    PolyKey = crypto:crypto_one_time(chacha20, K2, <<0:8/unit:8, Seq:8/unit:8>>,
+        <<0:32/unit:8>>, true),
+    Ctag = crypto:mac(poly1305, PolyKey, EncData),
+    <<EncData/binary, Ctag/binary>>;
+one_time('chacha20-poly1305', Key, Data, Opts = #{encrypt := false}) ->
+    Seq = maps:get(seq, Opts, 0),
+    <<K2:32/binary, _K1:32/binary>> = Key,
+    <<EncData:(byte_size(Data) - 16)/binary, Ctag:16/binary>> = Data,
+
+    IV = <<1:8/little-unit:8, Seq:8/unit:8>>,
+    PlainData = crypto:crypto_one_time(chacha20, K2, IV, EncData, false),
+
+    PolyKey = crypto:crypto_one_time(chacha20, K2, <<0:8/unit:8, Seq:8/unit:8>>,
+        <<0:32/unit:8>>, true),
+    OurCtag = crypto:mac(poly1305, PolyKey, EncData),
+
+    TheirHash = crypto:hash(sha512, Ctag),
+    OurHash = crypto:hash(sha512, OurCtag),
+    if
+        (TheirHash =:= OurHash) -> PlainData;
+        true -> error(bad_mac)
+    end.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+basic_chacha_encrypt_test() ->
+    Key = base64:decode(<<"si4+xc3NPBrHVFBWnUebmBGvs3N6a6XhoGCCeQAbPrWD3FbUGCQpO6gP4XSbloFIydqeKq93uPALjJEIFlHS0Q==">>),
+    Plain = <<"hi\n">>,
+    Cipher = one_time('chacha20-poly1305', Key, Plain, #{encrypt => true}),
+    ?assertMatch(<<"elw+TTiIP7TCByLdUiN6kjFMDA==">>, base64:encode(Cipher)).
+
+basic_chacha_decrypt_test() ->
+    Key = base64:decode(<<"si4+xc3NPBrHVFBWnUebmBGvs3N6a6XhoGCCeQAbPrWD3FbUGCQpO6gP4XSbloFIydqeKq93uPALjJEIFlHS0Q==">>),
+    Cipher = base64:decode(<<"elw+Y3XG9f5miJkHlW+QLaR02NKQTlTD">>),
+    Plain = one_time('chacha20-poly1305', Key, Cipher, #{encrypt => false}),
+    ?assertMatch(<<"hi\n", 5, 5, 5, 5, 5>>, Plain).
+
+invalid_chacha_decrypt_test() ->
+    Key = base64:decode(<<"si4+xc3NPBrHVFBWnUebmBGvs3N6a6XhoGCCeQAbPrWD3FbUGCQpO6gP4XSbloFIydqeKq93uPALjJEIFlHS0Q==">>),
+    Cipher = base64:decode(<<"elw+Y3XG9f5eiJkalW+QLaR02NKQTlTD">>),
+    ?assertError(bad_mac,
+        one_time('chacha20-poly1305', Key, Cipher, #{encrypt => false})).
+
+basic_aes_encrypt_test() ->
+    Key = base64:decode(<<"OnLlzSMvzgBLzT6+AoEI+A==">>),
+    IV = base64:decode(<<"GMOlgYXD5madK2U+">>),
+    Pad = binary:copy(<<13>>, 13),
+    Plain = <<"hi\n", Pad/binary>>,
+    Cipher = one_time('aes128-gcm', Key, Plain, #{encrypt => true, iv => IV}),
+    ?assertMatch(<<"94P4MU2MSoitPuyUeuPOuh+Wo5ZgKgSG2ju6SOojI0o=">>, base64:encode(Cipher)).
+
+basic_aes_decrypt_test() ->
+    Key = base64:decode(<<"OnLlzSMvzgBLzT6+AoEI+A==">>),
+    IV = base64:decode(<<"GMOlgYXD5madK2U+">>),
+    Cipher = base64:decode(<<"94P4MU2MSoitPuyUeuPOuh+Wo5ZgKgSG2ju6SOojI0o=">>),
+    Plain = one_time('aes128-gcm', Key, Cipher, #{encrypt => false, iv => IV}),
+    ?assertMatch(<<"hi\n", 13, _/binary>>, Plain).
+
+-endif.
