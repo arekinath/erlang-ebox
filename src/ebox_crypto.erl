@@ -28,10 +28,25 @@
 
 -module(ebox_crypto).
 
+-include_lib("public_key/include/public_key.hrl").
+
 -export([
     cipher_info/1,
-    one_time/4
+    one_time/4,
+    compress/1
     ]).
+
+compress(P = #'ECPoint'{point = <<16#02, _/binary>>}) -> P;
+compress(P = #'ECPoint'{point = <<16#03, _/binary>>}) -> P;
+compress(P = #'ECPoint'{point = <<16#04, Rest/binary>>}) ->
+    Half = byte_size(Rest) div 2,
+    <<X:Half/big-unit:8, Y:Half/big-unit:8>> = Rest,
+    case (Y rem 2) of
+        0 ->
+            P#'ECPoint'{point = <<16#02, X:Half/big-unit:8>>};
+        1 ->
+            P#'ECPoint'{point = <<16#03, X:Half/big-unit:8>>}
+    end.
 
 cipher_info('chacha20-poly1305') ->
     #{block_size => 8, key_len => 64, iv_len => 0, auth_len => 16};

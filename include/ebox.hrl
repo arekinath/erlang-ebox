@@ -43,11 +43,12 @@
     }).
 
 -record(ebox_tpl_part, {
-    name :: binary(),
+    name :: undefined | binary(),
     pubkey :: ebox:pubkey(),
-    cak :: ebox:pubkey(),
-    slot :: ebox:slot(),
-    guid :: ebox:guid()
+    cak :: undefined | ebox:pubkey(),
+    slot :: undefined | ebox:slot(),
+    guid :: ebox:guid(),
+    extra = [] :: [{integer(), binary()}]
     }).
 
 -record(ebox, {
@@ -55,7 +56,8 @@
     template :: ebox:tpl(),
     configs :: [ebox:config()],
     ephemeral_keys :: [ebox:pubkey()],
-    recovery_box :: ebox:recovery_box()
+    recovery_box :: ebox:recovery_box(),
+    key :: undefined | binary()
     }).
 
 -record(ebox_config, {
@@ -80,5 +82,13 @@
     kdf :: ebox:kdf(),
     nonce :: binary(),
     iv :: binary(),
-    ciphertext :: binary()
+    ciphertext :: undefined | binary(),
+    plaintext :: undefined | binary()
+    }).
+
+-record(ebox_recovery_box, {
+    cipher :: ebox:cipher(),
+    iv :: binary(),
+    ciphertext :: binary(),
+    plaintext :: undefined | binary()
     }).
