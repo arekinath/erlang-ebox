@@ -92,3 +92,20 @@
     ciphertext :: binary(),
     plaintext :: undefined | binary()
     }).
+
+-record(ebox_challenge, {
+    version :: integer(),
+    type :: recovery | verify_audit,
+    id :: integer(),
+    description :: string(),
+    hostname :: string(),
+    created :: integer(),
+    words :: [string()],
+    destkey :: ebox:pubkey(),
+    keybox :: ebox:box()
+    }).
+
+-record(ebox_challenge_resp, {
+    id :: integer(),
+    keypiece :: binary()
+    }).
