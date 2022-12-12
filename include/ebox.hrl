@@ -57,7 +57,8 @@
     configs :: [ebox:config()],
     ephemeral_keys :: [ebox:pubkey()],
     recovery_box :: ebox:recovery_box(),
-    key :: undefined | binary()
+    key :: undefined | binary(),
+    recovery_token :: undefined | binary()
     }).
 
 -record(ebox_config, {
@@ -68,7 +69,7 @@
 
 -record(ebox_part, {
     template :: ebox:tpl_part(),
-    id :: integer(),
+    id :: ebox:part_id(),
     box :: ebox:box()
     }).
 

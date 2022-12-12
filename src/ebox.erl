@@ -66,16 +66,20 @@
 -type cipher() :: 'chacha20-poly1305' | 'aes128-gcm' | 'aes256-gcm'.
 -type kdf() :: 'sha256' | 'sha384' | 'sha512'.
 
+-type part_id() :: integer().
+
 -type recovery_box() :: #ebox_recovery_box{}.
 
 -export_type([
     tpl_config/0, pubkey/0, tpl_part/0, slot/0,
     guid/0, tpl/0, ebox/0, config/0, part/0, box/0, cipher/0, kdf/0,
-    recovery_box/0
+    recovery_box/0, part_id/0
     ]).
 
 -export([
-    decode/1
+    decode/1,
+    decrypt_box/2,
+    decrypt/3
     ]).
 
 -define(EBOX_TEMPLATE, 16#01).
@@ -143,7 +147,8 @@ decode(<<16#EB, 16#0C, Version, ?EBOX_KEY, Rest0/binary>>) ->
             {[], Rest1}
     end,
     <<NConfigs, Rest3/binary>> = Rest2,
-    {Configs, <<>>} = n_decode(Version, NConfigs, fun decode_config/2, Rest3),
+    {Configs, <<>>} = n_decode(Version, NConfigs, Ephems, fun decode_config/3,
+        Rest3),
     Tpl = #ebox_tpl{
         version = 1,
         configs = [Tpl || #ebox_config{template = Tpl} <- Configs]
@@ -155,7 +160,7 @@ decode(<<16#EB, 16#0C, Version, ?EBOX_KEY, Rest0/binary>>) ->
         ephemeral_keys = Ephems,
         recovery_box = RecovBox
     };
-decode(<<16#EB, 16#0C, Version, ?EBOX_STREAM, Rest0/binary>>) ->
+decode(<<16#EB, 16#0C, _Version, ?EBOX_STREAM, _Rest0/binary>>) ->
     #ebox{}.
 
 -spec decode_box(binary()) -> {box(), binary()}.
@@ -193,12 +198,31 @@ decode_box(<<16#B0, 16#C5, Version, Rest0/binary>>) ->
     end,
     {B1, Rest5}.
 
--spec decrypt(box(), ebox_key:key()) -> {ok, box()} | {error, term()}.
-decrypt(B0 = #ebox_box{plaintext = undefined}, EboxKey) ->
+kdf(DH, #ebox_box{kdf = KDF, nonce = Nonce, cipher = Cipher}) ->
+    H0 = crypto:hash_init(KDF),
+    H1 = crypto:hash_update(H0, DH),
+    H2 = crypto:hash_update(H1, Nonce),
+    SharedSecret = crypto:hash_final(H2),
+    #{key_len := KeyLen} = ebox_crypto:cipher_info(Cipher),
+    binary:part(SharedSecret, {0, KeyLen}).
+
+unpad(Padded) ->
+    <<PadN>> = binary:part(Padded, {byte_size(Padded) - 1, 1}),
+    Plaintext = binary:part(Padded, {0, byte_size(Padded) - PadN}),
+    Pad = binary:part(Padded, {byte_size(Padded) - PadN, PadN}),
+    ExpectPad = binary:copy(<<PadN>>, PadN),
+    case Pad of
+        ExpectPad ->
+            {ok, Plaintext};
+        _ ->
+            {error, bad_padding}
+    end.
+
+-spec decrypt_box(box(), ebox_key:key()) -> {ok, box()} | {error, term()}.
+decrypt_box(B0 = #ebox_box{plaintext = undefined}, EboxKey) ->
     #ebox_box{unlock_key = {UnlockPub, UnlockCurveT},
-              cipher = CipherAtom} = B0,
-    CInfo = ebox_crypto:cipher_info(CipherAtom),
-    #{key_len := KeyLen} = CInfo,
+              ephemeral_key = EphemKey,
+              cipher = Cipher} = B0,
     {KeyMod, KeyData} = EboxKey,
     {ok, {OurPub, OurCurveT}} = KeyMod:get_public(KeyData),
     UnlockCurve = tup_to_curve(UnlockCurveT),
@@ -207,34 +231,21 @@ decrypt(B0 = #ebox_box{plaintext = undefined}, EboxKey) ->
     UnlockPoint = ebox_crypto:compress(UnlockPub),
     case {UnlockCurve, UnlockPoint} of
         {OurCurve, OurPoint} ->
-            #ebox_box{ephemeral_key = EphemKey, kdf = KDF} = B0,
-            H0 = crypto:hash_init(KDF),
             case KeyMod:compute_key(EphemKey, KeyData) of
                 {ok, DH} ->
-                    H1 = crypto:hash_update(H0, DH),
-                    #ebox_box{nonce = Nonce, iv = IV,
-                              ciphertext = Ciphertext} = B0,
-                    H2 = crypto:hash_update(H1, Nonce),
-                    SharedSecret = crypto:hash_final(H2),
-                    Key = binary:part(SharedSecret, {0, KeyLen}),
-                    R = (catch ebox_crypto:one_time(CipherAtom, Key,
+                    #ebox_box{iv = IV, ciphertext = Ciphertext} = B0,
+                    Key = kdf(DH, B0),
+                    R = (catch ebox_crypto:one_time(Cipher, Key,
                         Ciphertext, #{encrypt => false, iv => IV})),
                     case R of
                         {'EXIT', Why} ->
                             {error, Why};
                         Padded ->
-                            <<PadN>> = binary:part(Padded,
-                                {byte_size(Padded) - 1, 1}),
-                            Plaintext = binary:part(Padded,
-                                {0, byte_size(Padded) - PadN}),
-                            Pad = binary:part(Padded,
-                                {byte_size(Padded) - PadN, PadN}),
-                            ExpectPad = binary:copy(<<PadN>>, PadN),
-                            case Pad of
-                                ExpectPad ->
+                            case unpad(Padded) of
+                                {ok, Plaintext} ->
                                     {ok, B0#ebox_box{plaintext = Plaintext}};
-                                _ ->
-                                    {error, bad_padding}
+                                Err ->
+                                    Err
                             end
                     end;
                 Err ->
@@ -246,12 +257,73 @@ decrypt(B0 = #ebox_box{plaintext = undefined}, EboxKey) ->
             {error, curve_mismatch}
     end.
 
+-type part_map() :: #{part_id() => binary()}.
+
+decode_recov_data(<<16#01, Len, Token:Len/binary, Rest/binary>>) ->
+    maps:merge(#{token => Token}, decode_recov_data(Rest));
+decode_recov_data(<<16#02, Len, Key:Len/binary, Rest/binary>>) ->
+    maps:merge(#{key => Key}, decode_recov_data(Rest));
+decode_recov_data(<<>>) -> #{}.
+
+-spec decrypt(box(), config(), part_map()) -> {ok, ebox()} | {error, term()}.
+decrypt(Ebox0, #ebox_config{template = #ebox_tpl_primary_config{}}, PartMap) ->
+    {_PartId, Key, _} = maps:next(maps:iterator(PartMap)),
+    {ok, Ebox0#ebox{key = Key}};
+decrypt(Ebox0, C = #ebox_config{template = T = #ebox_tpl_recovery_config{}}, PartMap) ->
+    #ebox_tpl_recovery_config{required = N, parts = P} = T,
+    #ebox_config{nonce = Nonce} = C,
+    M = length(P),
+    Given = maps:size(PartMap),
+    if
+        (Given >= N) ->
+            ConfigKey = sss_nif:combine_keyshares(maps:values(PartMap), M),
+            RecovKey = crypto:exor(ConfigKey, Nonce),
+            #ebox{recovery_box = RB0} = Ebox0,
+            #ebox_recovery_box{cipher = Cipher, iv = IV,
+                               ciphertext = Enc} = RB0,
+            R = (catch ebox_crypto:one_time(Cipher, RecovKey, Enc,
+                #{encrypt => false, iv => IV})),
+            case R of
+                {'EXIT', Why} ->
+                    {error, Why};
+                Padded ->
+                    case unpad(Padded) of
+                        {ok, Plain} ->
+                            RD = decode_recov_data(Plain),
+                            #{key := Key} = RD,
+                            Token = maps:get(token, RD, undefined),
+                            RB1 = RB0#ebox_recovery_box{plaintext = Plain},
+                            Ebox1 = Ebox0#ebox{key = Key,
+                                               recovery_box = RB1,
+                                               recovery_token = Token},
+                            {ok, Ebox1};
+                        Err ->
+                            Err
+                    end
+            end;
+        true ->
+            {error, insufficient_parts}
+    end.
+
 -spec n_decode(integer(), integer(),
         fun((integer(), binary()) -> {any(), binary()}), binary())
     -> {[any()], binary()}.
 n_decode(V, N, Fun, Rest0) ->
     lists:foldl(fun (NN, {SoFar, Rest1}) ->
         {Rec0, Rest2} = Fun(V, Rest1),
+        Rec1 = case Rec0 of
+            P = #ebox_part{} -> P#ebox_part{id = NN};
+            _ -> Rec0
+        end,
+        {[Rec1 | SoFar], Rest2}
+    end, {[], Rest0}, lists:seq(1, N)).
+
+-spec n_decode(integer(), integer(), term(),
+        fun((integer(), term(), binary()) -> {any(), binary()}), binary())
+    -> {[any()], binary()}.
+n_decode(V, N, Extra, Fun, Rest0) ->
+    lists:foldl(fun (NN, {SoFar, Rest1}) ->
+        {Rec0, Rest2} = Fun(V, Extra, Rest1),
         Rec1 = case Rec0 of
             P = #ebox_part{} -> P#ebox_part{id = NN};
             _ -> Rec0
@@ -279,7 +351,7 @@ decode_tpl_config(V, <<?EBOX_RECOVERY, N, M, Rest0/binary>>) ->
         required = N
     }, Rest1}.
 
-decode_config(V, <<?EBOX_PRIMARY, N, M, Rest0/binary>>) ->
+decode_config(V, Ephems, <<?EBOX_PRIMARY, N, M, Rest0/binary>>) ->
     {Nonce, Rest1} = if
         (V >= 3) ->
             <<0, RR1/binary>> = Rest0,
@@ -287,7 +359,7 @@ decode_config(V, <<?EBOX_PRIMARY, N, M, Rest0/binary>>) ->
         true ->
             {<<>>, Rest0}
     end,
-    {Parts, Rest2} = n_decode(V, M, fun decode_part/2, Rest1),
+    {Parts, Rest2} = n_decode(V, M, Ephems, fun decode_part/3, Rest1),
     N = M,
     {#ebox_config{
         template = #ebox_tpl_primary_config{
@@ -296,7 +368,7 @@ decode_config(V, <<?EBOX_PRIMARY, N, M, Rest0/binary>>) ->
         parts = Parts,
         nonce = Nonce
     }, Rest2};
-decode_config(V, <<?EBOX_RECOVERY, N, M, Rest0/binary>>) ->
+decode_config(V, Ephems, <<?EBOX_RECOVERY, N, M, Rest0/binary>>) ->
     {Nonce, Rest1} = if
         (V >= 3) ->
             <<NoLen, No:NoLen/binary, RR1/binary>> = Rest0,
@@ -304,7 +376,7 @@ decode_config(V, <<?EBOX_RECOVERY, N, M, Rest0/binary>>) ->
         true ->
             {<<>>, Rest0}
     end,
-    {Parts, Rest2} = n_decode(V, M, fun decode_part/2, Rest1),
+    {Parts, Rest2} = n_decode(V, M, Ephems, fun decode_part/3, Rest1),
     true = (N =< M),
     {#ebox_config{
         template = #ebox_tpl_recovery_config{
@@ -323,18 +395,23 @@ decode_config(V, <<?EBOX_RECOVERY, N, M, Rest0/binary>>) ->
 -define(EBOX_PART_BOX, 5).
 -define(EBOX_PART_SLOT, 6).
 
-decode_part(V, Rest0) ->
-    {R, Rest1} = decode_part_tag(V,
+decode_part(V, Ephems, Rest0) ->
+    {R0, Rest1} = decode_part_tag(V,
         #ebox_part{template = #ebox_tpl_part{}}, Rest0),
-    case R of
+    case R0 of
         #ebox_part{box = undefined} ->
             error(box_required);
-        #ebox_part{template = #ebox_tpl_part{pubkey = undefined}} ->
-            error(pubkey_required);
-        #ebox_part{template = #ebox_tpl_part{guid = undefined}} ->
-            error(guid_required);
         _ ->
-            {R, Rest1}
+            #ebox_part{box = B0, template = Tpl0} = R0,
+            #ebox_box{unlock_key = {UnlockPoint, UnlockCurve}} = B0,
+            [EphemPt] = [XPoint || {XPoint, XCurve} <- Ephems,
+                                 XCurve =:= UnlockCurve],
+            #ebox_tpl_part{guid = Guid, slot = Slot} = Tpl0,
+            Tpl1 = Tpl0#ebox_tpl_part{pubkey = {UnlockPoint, UnlockCurve}},
+            B1 = B0#ebox_box{guid = Guid, slot = Slot,
+                             ephemeral_key = {EphemPt, UnlockCurve}},
+            R1 = R0#ebox_part{box = B1, template = Tpl1},
+            {R1, Rest1}
     end.
 
 decode_part_tag(_V, R0 = #ebox_part{}, <<?EBOX_PART_END, Rest/binary>>) ->
@@ -376,9 +453,34 @@ decode_part_tag(V, R0 = #ebox_part{template = T0 = #ebox_tpl_part{}},
     decode_part_tag(V, R1, Rest);
 decode_part_tag(V, R0 = #ebox_part{},
                             <<?EBOX_PART_BOX, Rest0/binary>>) when (V < 2) ->
-    {Box, Rest} = decode_box(Rest0),
+    {Box, Rest1} = decode_box(Rest0),
     R1 = R0#ebox_part{box = Box},
-    decode_part_tag(V, R1, Rest).
+    decode_part_tag(V, R1, Rest1);
+decode_part_tag(V, R0 = #ebox_part{},
+                            <<?EBOX_PART_BOX, Rest0/binary>>) ->
+    <<CipherLen, Cipher:CipherLen/binary, KDFLen, KDF:KDFLen/binary,
+      NonceLen, Nonce:NonceLen/binary, CurveLen, Curve:CurveLen/binary,
+      PubKeyLen, PubKey:PubKeyLen/binary, IVLen, IV:IVLen/binary,
+      EncLen:32/big, Enc:EncLen/binary, Rest1/binary>> = Rest0,
+    CurveTup = curve_to_tup(Curve),
+    KDFAtom = case KDF of
+        <<"sha256">> -> 'sha256';
+        <<"sha384">> -> 'sha384';
+        <<"sha512">> -> 'sha512'
+    end,
+    Box = #ebox_box{
+        version = 2,
+        guid = none,
+        slot = none,
+        unlock_key = {#'ECPoint'{point = PubKey}, CurveTup},
+        cipher = cipher_to_atom(Cipher),
+        kdf = KDFAtom,
+        nonce = Nonce,
+        iv = IV,
+        ciphertext = Enc
+    },
+    R1 = R0#ebox_part{box = Box},
+    decode_part_tag(V, R1, Rest1).
 
 decode_tpl_part(V, Rest0) ->
     {R, Rest1} = decode_tpl_part_tag(V, #ebox_tpl_part{}, Rest0),
@@ -435,9 +537,9 @@ decode_sshkey(RSAType,
         modulus = N,
         publicExponent = E
     };
-decode_sshkey(ECType = <<"ecdsa-sha2-",_/binary>>,
-                            <<CurveLen:32/big, Curve:CurveLen/binary,
-                              PointLen:32/big, Point:PointLen/binary>>) ->
+decode_sshkey(<<"ecdsa-sha2-",_/binary>>,
+              <<CurveLen:32/big, Curve:CurveLen/binary,
+                PointLen:32/big, Point:PointLen/binary>>) ->
     CurveTup = curve_to_tup(Curve),
     {#'ECPoint'{point = Point}, CurveTup}.
 
@@ -461,9 +563,9 @@ tpl_decode_test() ->
         "hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEEnCdFUQqwMQuUzjV/UurGOzWcz2o"
         "8Cz+AiF5kcpe1SutIEG8vpcfsYl3dVEw4Us5+ARpFoUrmPVFpgxuEwoeK/wA=">>),
     Rec = decode(Data),
-    ?assertMatch(#ebox_tpl{version = 1, configs = Configs}, Rec),
+    ?assertMatch(#ebox_tpl{version = 1, configs = _}, Rec),
     #ebox_tpl{configs = Configs} = Rec,
-    ?assertMatch([#ebox_tpl_primary_config{parts = Parts}], Configs),
+    ?assertMatch([#ebox_tpl_primary_config{parts = _}], Configs),
     [#ebox_tpl_primary_config{parts = Parts}] = Configs,
     ?assertMatch([#ebox_tpl_part{name = <<"davo yk5a">>}], Parts),
     [#ebox_tpl_part{pubkey = PubKey}] = Parts,
@@ -474,14 +576,14 @@ tpl_decode_test() ->
         "-----END PUBLIC KEY-----\n">>),
     {PubPoint, Curve} = PubKey,
     OtherPubKey = public_key:pem_entry_decode(PemEntry),
-    {OtherPoint, OtherCurve} = OtherPubKey,
+    {OtherPoint, _OtherCurve} = OtherPubKey,
     ?assertMatch(PubPoint, ebox_crypto:compress(OtherPoint)),
     TempKey = public_key:generate_key(Curve),
     DHA = public_key:compute_key(element(1,OtherPubKey), TempKey),
     DHB = public_key:compute_key(PubPoint, TempKey),
     ?assertMatch(DHA, DHB).
 
-decrypt_test() ->
+decrypt_box_test() ->
     Data = base64:decode(<<
         "sMUCAAAAEWNoYWNoYTIwLXBvbHkxMzA1BnNoYTUxMhC30h3EX8NYrs3tguTV30Q2CG5pc3RwMjU2"
         "IQNYCOQj68B+IHhz3m3foWRT+YmpXfwYjEfM5k6EHWfPsSEDwLstPYwYoa76ChPJeJZVlSrwkBMt"
@@ -494,7 +596,67 @@ decrypt_test() ->
         "XmgAkUOx8hG332rqMqK3sDaoNw0HpAZJ2w==\n"
         "-----END EC PRIVATE KEY-----\n">>),
     PrivKey = public_key:pem_entry_decode(PemEntry),
-    Rec1 = decrypt(Rec0, {ebox_key_stdlib, PrivKey}),
+    Rec1 = decrypt_box(Rec0, {ebox_key_stdlib, PrivKey}),
     ?assertMatch({ok, #ebox_box{plaintext = <<"hello\n">>}}, Rec1).
+
+decrypt_primary_test() ->
+    Data = base64:decode(<<
+        "6wwDAgphZXMyNTYtZ2NtDIRjpC65tyNuLbzZmiCZHo1LuTmxB6tsYblV88Yi3Z5Cm"
+        "19Zw01DlvcRJAQ/gwEIbmlzdHAzODQxAhveeDL+bSA6WRa1iB4KukoN4fUT9ONfcC"
+        "0qD2APkwuxpoBVLsP1wzVnOAZecVZ67AEBAQEABBAAAAAAAAAAAAAAAAAAAAAAAgd"
+        "0ZXN0a2V5BRFjaGFjaGEyMC1wb2x5MTMwNQZzaGE1MTIQNILe0stAzXz45lOmZGnW"
+        "kQhuaXN0cDM4NDEClexz9jRax2zcBJS9YzyHp2FsBcmlp5s2z/YnM+d/zX1qZN3Wf"
+        "44aIryUH6YBoVKIAAAAABjPZOL/jK+luGp1k2IjJwPnIejZIsu9GCcA">>),
+    Ebox0 = decode(Data),
+    {ok, Pem} = file:read_file("test/testkey.pem"),
+    [PemEntry] = public_key:pem_decode(Pem),
+    PrivKey = public_key:pem_entry_decode(PemEntry),
+    #ebox{configs = [Config]} = Ebox0,
+    #ebox_config{parts = [Part]} = Config,
+    #ebox_part{box = B0, id = Id} = Part,
+    {ok, B1} = decrypt_box(B0, {ebox_key_stdlib, PrivKey}),
+    #ebox_box{plaintext = Plain} = B1,
+    PartPlains = #{Id => Plain},
+    Out = decrypt(Ebox0, Config, PartPlains),
+    ?assertMatch({ok, #ebox{key = <<"hello\n">>}}, Out).
+
+decrypt_recovery_test() ->
+    Data = base64:decode(<<
+        "6wwDAgphZXMyNTYtZ2NtDCyR72zT1Pg2w3eV+yAv9E/9ffjVeR5UMlFZq6bGqNpZr"
+        "jituUP4sMFwBxnpcQIIbmlzdHAyNTYhAiEQJcJBj2KvUZbQWRXZSIRk9R3MmcWQBE"
+        "hHJOoZyYInCG5pc3RwMzg0MQN4pdhUC/Uv1eVjd7ulDOOSLvtukfANjXMs+uiKEIC"
+        "NY90VIyvpUoMCAKA0NhLQT+oBAgICIPla0K2sheVg64HvJx6nK/30lB15ggwE5t8s"
+        "rWC0BBrIBBAAAAAAAAAAAAAAAAAAAAAAAgd0ZXN0a2V5BRFjaGFjaGEyMC1wb2x5M"
+        "TMwNQZzaGE1MTIQWt0UFx0TmHWLuKrVfQ0sRAhuaXN0cDM4NDEClexz9jRax2zcBJ"
+        "S9YzyHp2FsBcmlp5s2z/YnM+d/zX1qZN3Wf44aIryUH6YBoVKIAAAAADiU1EjBC/z"
+        "T6Se8prHaax+4LxwDGVX97Tw194F02s8HZOqNnlmnzaBtcMIUohiWLgSc+y7SVM6M"
+        "sQAEEAAAAAAAAAAAAAAAAAAAAAACCHRlc3RrZXkyBRFjaGFjaGEyMC1wb2x5MTMwN"
+        "QZzaGE1MTIQI43HxUlIjIPf16LGzpX5CAhuaXN0cDI1NiECaGxisO2yvD2cvrwwnb"
+        "yr1Qx+LbwMBHGptudSF9xS0HMAAAAAODT3NghzOzXppteqp/kTyb2iUFHvsUyX4p4"
+        "PEQpHTJ7ds1+I1hwAVwackIJTUfZQP3ojsg51sjpOAA==">>),
+    Ebox0 = decode(Data),
+    {ok, Pem0} = file:read_file("test/testkey2.pem"),
+    [PemEntry0] = public_key:pem_decode(Pem0),
+    PrivKey0 = public_key:pem_entry_decode(PemEntry0),
+    {ok, Pem1} = file:read_file("test/testkey.pem"),
+    [PemEntry1] = public_key:pem_decode(Pem1),
+    PrivKey1 = public_key:pem_entry_decode(PemEntry1),
+    ?assertMatch(#ebox{configs = [_]}, Ebox0),
+    #ebox{configs = [Config]} = Ebox0,
+    ?assertMatch(#ebox_config{parts = [_, _]}, Config),
+    #ebox_config{parts = [Part0, Part1]} = Config,
+    #ebox_part{box = B0, id = Id0} = Part0,
+    #ebox_part{box = B1, id = Id1} = Part1,
+    ?assertMatch(#ebox_part{template = #ebox_tpl_part{name = <<"testkey2">>}},
+        Part0),
+    ?assertMatch(#ebox_part{template = #ebox_tpl_part{name = <<"testkey">>}},
+        Part1),
+    {ok, #ebox_box{plaintext = Plain0}} = decrypt_box(B0, {ebox_key_stdlib, PrivKey0}),
+    {ok, #ebox_box{plaintext = Plain1}} = decrypt_box(B1, {ebox_key_stdlib, PrivKey1}),
+    PartMap0 = #{Id0 => Plain0},
+    ?assertMatch({error, _}, decrypt(Ebox0, Config, PartMap0)),
+    PartMap1 = PartMap0#{Id1 => Plain1},
+    R = decrypt(Ebox0, Config, PartMap1),
+    ?assertMatch({ok, #ebox{key = <<"world\n">>, recovery_token = undefined}}, R).
 
 -endif.
