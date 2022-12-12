@@ -79,7 +79,9 @@
 -export([
     decode/1,
     decrypt_box/2,
-    decrypt/3
+    decrypt/3,
+    encode/1,
+    encrypt_box/1
     ]).
 
 -define(EBOX_TEMPLATE, 16#01).
@@ -89,21 +91,23 @@
 -define(EBOX_PRIMARY, 16#01).
 -define(EBOX_RECOVERY, 16#02).
 
-slot_to_sym(Slot) ->
-    case Slot of
-        16#9a -> piv_auth;
-        16#9c -> piv_sign;
-        16#9e -> piv_card_auth;
-        16#9d -> piv_key_mgmt;
-        _ -> Slot
-    end.
+slot_to_sym(0) -> none;
+slot_to_sym(16#9a) -> piv_auth;
+slot_to_sym(16#9c) -> piv_sign;
+slot_to_sym(16#9e) -> piv_card_auth;
+slot_to_sym(16#9d) -> piv_key_mgmt;
+slot_to_sym(Slot) when is_integer(Slot) -> Slot.
 
-curve_to_tup(Curve) ->
-    case Curve of
-        <<"nistp256">> -> {namedCurve, secp256r1};
-        <<"nistp384">> -> {namedCurve, secp384r1};
-        <<"nistp521">> -> {namedCurve, secp521r1}
-    end.
+sym_to_slot(none) -> 0;
+sym_to_slot(piv_auth) -> 16#9a;
+sym_to_slot(piv_sign) -> 16#9c;
+sym_to_slot(piv_card_auth) -> 16#9e;
+sym_to_slot(piv_key_mgmt) -> 16#9d;
+sym_to_slot(Slot) when is_integer(Slot) -> Slot.
+
+curve_to_tup(<<"nistp256">>) -> {namedCurve, secp256r1};
+curve_to_tup(<<"nistp384">>) -> {namedCurve, secp384r1};
+curve_to_tup(<<"nistp521">>) -> {namedCurve, secp521r1}.
 
 tup_to_curve({namedCurve, secp256r1}) -> <<"nistp256">>;
 tup_to_curve({namedCurve, ?'secp256r1'}) -> <<"nistp256">>;
@@ -112,12 +116,52 @@ tup_to_curve({namedCurve, ?'secp384r1'}) -> <<"nistp384">>;
 tup_to_curve({namedCurve, secp521r1}) -> <<"nistp521">>;
 tup_to_curve({namedCurve, ?'secp521r1'}) -> <<"nistp521">>.
 
-cipher_to_atom(Cipher) ->
-    case Cipher of
-        <<"chacha20-poly1305">> -> 'chacha20-poly1305';
-        <<"aes128-gcm">> -> 'aes128-gcm';
-        <<"aes256-gcm">> -> 'aes256-gcm'
-    end.
+kdf_to_atom(<<"sha256">>) -> sha256;
+kdf_to_atom(<<"sha384">>) -> sha384;
+kdf_to_atom(<<"sha512">>) -> sha512.
+
+cipher_to_atom(<<"chacha20-poly1305">>) -> 'chacha20-poly1305';
+cipher_to_atom(<<"aes128-gcm">>) -> 'aes128-gcm';
+cipher_to_atom(<<"aes256-gcm">>) -> 'aes256-gcm'.
+
+atom_to_kdf(sha256) -> <<"sha256">>;
+atom_to_kdf(sha384) -> <<"sha384">>;
+atom_to_kdf(sha512) -> <<"sha512">>.
+
+atom_to_cipher('chacha20-poly1305') -> <<"chacha20-poly1305">>;
+atom_to_cipher('aes128-gcm') -> <<"aes128-gcm">>;
+atom_to_cipher('aes256-gcm') -> <<"aes256-gcm">>.
+
+encode(#ebox_box{version = Version, guid = Guid, slot = Slot,
+                 ephemeral_key = {#'ECPoint'{point = EphemPt}, EphemCurve},
+                 unlock_key = {#'ECPoint'{point = UnlockPt}, UnlockCurve},
+                 cipher = CipherAtom, kdf = KDFAtom, nonce = Nonce,
+                 iv = IV, ciphertext = Enc}) ->
+    VerNum = case Version of
+        latest -> 2;
+        _ -> Version
+    end,
+    Cipher = atom_to_cipher(CipherAtom),
+    KDF = atom_to_kdf(KDFAtom),
+    SlotNum = sym_to_slot(Slot),
+    Curve = tup_to_curve(EphemCurve),
+    Curve = tup_to_curve(UnlockCurve),
+    GuidBin = case Guid of
+        none -> <<0:128>>;
+        _ -> Guid
+    end,
+    GuidSlotValid = case {Guid, Slot} of
+        {none, none} -> 0;
+        _ -> 1
+    end,
+    <<16#B0, 16#C5, VerNum, GuidSlotValid,
+      (byte_size(GuidBin)), GuidBin/binary, SlotNum,
+      (byte_size(Cipher)), Cipher/binary, (byte_size(KDF)), KDF/binary,
+      (byte_size(Nonce)), Nonce/binary, (byte_size(Curve)), Curve/binary,
+      (byte_size(UnlockPt)), UnlockPt/binary,
+      (byte_size(EphemPt)), EphemPt/binary,
+      (byte_size(IV)), IV/binary,
+      (byte_size(Enc)):32/big, Enc/binary>>.
 
 decode(B = <<16#B0, 16#C5, Version, _Rest0/binary>>)
                                     when (Version >= 1) and (Version =< 2) ->
@@ -171,11 +215,7 @@ decode_box(<<16#B0, 16#C5, Version, Rest0/binary>>) ->
     <<PubKeyLen, PubKey:PubKeyLen/binary, EphKeyLen, EphKey:EphKeyLen/binary, Rest4/binary>> = Rest3,
     <<IVLen, IV:IVLen/binary, EncLen:32/big, Enc:EncLen/binary, Rest5/binary>> = Rest4,
     CipherAtom = cipher_to_atom(Cipher),
-    KDFAtom = case KDF of
-        <<"sha256">> -> 'sha256';
-        <<"sha384">> -> 'sha384';
-        <<"sha512">> -> 'sha512'
-    end,
+    KDFAtom = kdf_to_atom(KDF),
     CurveTup = curve_to_tup(Curve),
     EphKeyRec = {#'ECPoint'{point = EphKey}, CurveTup},
     PubKeyRec = {#'ECPoint'{point = PubKey}, CurveTup},
@@ -216,6 +256,39 @@ unpad(Padded) ->
             {ok, Plaintext};
         _ ->
             {error, bad_padding}
+    end.
+
+pad(Data, BlockSz) ->
+    PadN = BlockSz - (byte_size(Data) rem BlockSz),
+    Pad = binary:copy(<<PadN>>, PadN),
+    <<Data/binary, Pad/binary>>.
+
+-spec encrypt_box(box()) -> {ok, box()} | {error, term()}.
+encrypt_box(B0 = #ebox_box{ciphertext = undefined, unlock_key = UnlockKey}) ->
+    #ebox_box{cipher = Cipher, plaintext = Plain} = B0,
+    #{block_size := BlockSz, iv_len := IVLen} = ebox_crypto:cipher_info(Cipher),
+    {UnlockPt, UnlockCurve} = UnlockKey,
+    EphemPriv = public_key:generate_key(UnlockCurve),
+    #'ECPrivateKey'{publicKey = EphemPt} = EphemPriv,
+    Nonce = crypto:strong_rand_bytes(16),
+    IV = crypto:strong_rand_bytes(IVLen),
+
+    B1 = B0#ebox_box{ephemeral_key = {#'ECPoint'{point = EphemPt}, UnlockCurve},
+                     nonce = Nonce,
+                     iv = IV},
+
+    Padded = pad(Plain, BlockSz),
+    DH = public_key:compute_key(UnlockPt, EphemPriv),
+    Key = kdf(DH, B1),
+
+    R = (catch ebox_crypto:one_time(Cipher, Key, Padded, #{encrypt => true,
+        iv => IV})),
+    case R of
+        {'EXIT', Why} ->
+            {error, Why};
+        Enc ->
+            B2 = B1#ebox_box{ciphertext = Enc},
+            {ok, B2}
     end.
 
 -spec decrypt_box(box(), ebox_key:key()) -> {ok, box()} | {error, term()}.
@@ -463,11 +536,7 @@ decode_part_tag(V, R0 = #ebox_part{},
       PubKeyLen, PubKey:PubKeyLen/binary, IVLen, IV:IVLen/binary,
       EncLen:32/big, Enc:EncLen/binary, Rest1/binary>> = Rest0,
     CurveTup = curve_to_tup(Curve),
-    KDFAtom = case KDF of
-        <<"sha256">> -> 'sha256';
-        <<"sha384">> -> 'sha384';
-        <<"sha512">> -> 'sha512'
-    end,
+    KDFAtom = kdf_to_atom(KDF),
     Box = #ebox_box{
         version = 2,
         guid = none,
@@ -555,6 +624,16 @@ basic_decode_test() ->
     Rec = decode(Data),
     ?assertMatch(#ebox_box{version = 2, slot = piv_card_auth,
         cipher = 'aes128-gcm', kdf = sha512}, Rec).
+
+round_trip_test() ->
+    Data = base64:decode(<<
+        "sMUCARBWKiDkLtDlgTxTDtf+db6SngphZXMxMjgtZ2NtBnNoYTUxMhDkzofO3HUQ7W2SzAGd9F8e"
+        "CG5pc3RwMjU2IQIo2upIX755FeKUNSBlX8wE4ZJOWPJa6wGi7AU0TPDVyiEDrqzhRu7lkeGo5xSz"
+        "/Ev8Sf2BBSjyeF9DkQzFsQMRgUQMGMOlgYXD5madK2U+AAAAIPeD+DFNjEqIrT7slHrjzroflqOW"
+        "YCoEhto7ukjqIyNK">>),
+    Rec = decode(Data),
+    Data2 = encode(Rec),
+    ?assertMatch(Data, Data2).
 
 tpl_decode_test() ->
     Data = base64:decode(<<
@@ -658,5 +737,23 @@ decrypt_recovery_test() ->
     PartMap1 = PartMap0#{Id1 => Plain1},
     R = decrypt(Ebox0, Config, PartMap1),
     ?assertMatch({ok, #ebox{key = <<"world\n">>, recovery_token = undefined}}, R).
+
+encrypt_box_test() ->
+    {ok, Pem} = file:read_file("test/testkey.pem"),
+    [PemEntry] = public_key:pem_decode(Pem),
+    PrivKey = public_key:pem_entry_decode(PemEntry),
+    #'ECPrivateKey'{parameters = C = {namedCurve, _},
+                    publicKey = PubKeyPt} = PrivKey,
+    PubKey = {#'ECPoint'{point=PubKeyPt}, C},
+    B0 = #ebox_box{
+        plaintext = <<"hello world">>,
+        unlock_key = PubKey
+    },
+    {ok, B1} = encrypt_box(B0),
+    Data = encode(B1),
+    B2 = decode(Data),
+    ?assertMatch({ok, #ebox_box{plaintext = <<"hello world">>}},
+        decrypt_box(B2, {ebox_key_stdlib, PrivKey})).
+
 
 -endif.

@@ -29,7 +29,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -record(ebox_tpl, {
-    version :: integer(),
+    version :: latest | integer(),
     configs :: [ebox:tpl_config()]
     }).
 
@@ -52,7 +52,7 @@
     }).
 
 -record(ebox, {
-    version :: integer(),
+    version :: latest | integer(),
     template :: ebox:tpl(),
     configs :: [ebox:config()],
     ephemeral_keys :: [ebox:pubkey()],
@@ -74,15 +74,15 @@
     }).
 
 -record(ebox_box, {
-    version :: integer(),
-    guid :: none | ebox:guid(),
-    slot :: none | ebox:slot(),
-    ephemeral_key :: ebox:pubkey(),
+    version = latest :: latest | integer(),
+    guid = none :: none | ebox:guid(),
+    slot = none :: none | ebox:slot(),
+    ephemeral_key :: undefined | ebox:pubkey(),
     unlock_key :: ebox:pubkey(),
-    cipher :: ebox:cipher(),
-    kdf :: ebox:kdf(),
-    nonce :: binary(),
-    iv :: binary(),
+    cipher = 'chacha20-poly1305' :: ebox:cipher(),
+    kdf = 'sha512' :: ebox:kdf(),
+    nonce :: undefined | binary(),
+    iv :: undefined | binary(),
     ciphertext :: undefined | binary(),
     plaintext :: undefined | binary()
     }).
@@ -95,7 +95,7 @@
     }).
 
 -record(ebox_challenge, {
-    version :: integer(),
+    version :: latest | integer(),
     type :: recovery | verify_audit,
     id :: integer(),
     description :: string(),
