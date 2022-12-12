@@ -98,15 +98,10 @@
     version :: latest | integer(),
     type :: recovery | verify_audit,
     id :: integer(),
-    description :: string(),
-    hostname :: string(),
-    created :: integer(),
-    words :: [string()],
+    description :: undefined | string(),
+    hostname :: undefined | string(),
+    created :: undefined | integer(),
+    words :: undefined | [string()],
     destkey :: ebox:pubkey(),
     keybox :: ebox:box()
-    }).
-
--record(ebox_challenge_resp, {
-    id :: integer(),
-    keypiece :: binary()
     }).

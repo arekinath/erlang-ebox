@@ -81,7 +81,9 @@
     decrypt_box/2,
     decrypt/3,
     encode/1,
-    encrypt_box/1
+    encrypt_box/1,
+    decode_challenge/1,
+    response_box/2
     ]).
 
 -define(EBOX_TEMPLATE, 16#01).
@@ -263,7 +265,7 @@ pad(Data, BlockSz) ->
     Pad = binary:copy(<<PadN>>, PadN),
     <<Data/binary, Pad/binary>>.
 
--spec encrypt_box(box()) -> {ok, box()} | {error, term()}.
+-spec encrypt_box(box()) -> box().
 encrypt_box(B0 = #ebox_box{ciphertext = undefined, unlock_key = UnlockKey}) ->
     #ebox_box{cipher = Cipher, plaintext = Plain} = B0,
     #{block_size := BlockSz, iv_len := IVLen} = ebox_crypto:cipher_info(Cipher),
@@ -272,8 +274,9 @@ encrypt_box(B0 = #ebox_box{ciphertext = undefined, unlock_key = UnlockKey}) ->
     #'ECPrivateKey'{publicKey = EphemPt} = EphemPriv,
     Nonce = crypto:strong_rand_bytes(16),
     IV = crypto:strong_rand_bytes(IVLen),
+    EphemPoint = ebox_crypto:compress(#'ECPoint'{point = EphemPt}),
 
-    B1 = B0#ebox_box{ephemeral_key = {#'ECPoint'{point = EphemPt}, UnlockCurve},
+    B1 = B0#ebox_box{ephemeral_key = {EphemPoint, UnlockCurve},
                      nonce = Nonce,
                      iv = IV},
 
@@ -281,15 +284,9 @@ encrypt_box(B0 = #ebox_box{ciphertext = undefined, unlock_key = UnlockKey}) ->
     DH = public_key:compute_key(UnlockPt, EphemPriv),
     Key = kdf(DH, B1),
 
-    R = (catch ebox_crypto:one_time(Cipher, Key, Padded, #{encrypt => true,
-        iv => IV})),
-    case R of
-        {'EXIT', Why} ->
-            {error, Why};
-        Enc ->
-            B2 = B1#ebox_box{ciphertext = Enc},
-            {ok, B2}
-    end.
+    Enc = ebox_crypto:one_time(Cipher, Key, Padded, #{encrypt => true,
+        iv => IV}),
+    B1#ebox_box{ciphertext = Enc}.
 
 -spec decrypt_box(box(), ebox_key:key()) -> {ok, box()} | {error, term()}.
 decrypt_box(B0 = #ebox_box{plaintext = undefined}, EboxKey) ->
@@ -612,6 +609,116 @@ decode_sshkey(<<"ecdsa-sha2-",_/binary>>,
     CurveTup = curve_to_tup(Curve),
     {#'ECPoint'{point = Point}, CurveTup}.
 
+chal_word(N) ->
+    List = {"abandoned","abilities","academic","accent",
+    "adaptation","adventure","aerial","affair","against","aircraft","afternoon",
+    "alcohol","aquarium","asbestos","auburn","availability","analyze",
+    "appearance","athletics","awarded","awesome","babies","balanced",
+    "battlefield","banana","beaches","because","bicycle","blocked","boards",
+    "border","breakfast","bubble","burning","cabinet","ceiling","chains",
+    "circle","citizen","claimed","cloud","collaboration","coaches","comparison",
+    "cradle","cuisine","connected","cooking","creativity","cylinder",
+    "dangerous","deadly","dedicated","demanding","deputy","diagram","diversity",
+    "doctor","dragon","duplicate","dynamic","eagle","earthquake","eclipse",
+    "economics","education","effect","either","elderly","empire","email",
+    "enable","engines","equality","equipment","escape","eternal","eventually",
+    "evaluate","exceptional","expanded","extraordinary","fabric","fantastic",
+    "feature","fiction","flashing","focused","forest","fraction","frontier",
+    "fusion","family","gambling","gender","giants","glance","golden","grade",
+    "guarantee","habitat","headed","hidden","hobbies","humanity","hunter",
+    "hybrid","iceland","identical","ignore","illegal","images","inappropriate",
+    "intermediate","involvement","ireland","impact","inspiration","island",
+    "itself","jacket","jewellery","journalism","judge","jumping","kansas",
+    "keeping","keyword","kidney","knight","korean","kuwait","labeled",
+    "language","launch","leadership","leaving","letters","liabilities",
+    "lifestyle","logical","loaded","luggage","lyrics","maintenance",
+    "manufacture","meaning","mineral","mobile","motivated","multimedia",
+    "murder","mysterious","namely","nearby","niagara","nobody","nuclear",
+    "narrative","navigator","oakland","obesity","occasion","offense",
+    "oklahoma","oldest","omissions","ongoing","opened","oracle","others",
+    "ourselves","overall","owners","oxford","pacific","peaceful","phantom",
+    "picture","placed","pocket","practical","psychiatry","position","powder",
+    "public","python","puzzle","qualification","quarter","rabbit","racing",
+    "reached","rhythm","rational","recall","relocation","rotation","sacred",
+    "scales","seafood","seeking","shades","segments","sequence","skating",
+    "sleeping","smaller","snapshot","soccer","spaces","square","stability",
+    "settlement","slideshow","syndicate","tables","teacher","template","things",
+    "ticket","towards","traditional","tsunami","tucson","twelve","typical",
+    "uganda","ukraine","ultimate","unable","upcoming","urgent","useful",
+    "utilities","vacancies","vector","victim","vocabulary","vulnerability",
+    "wagner","wealth","whatever","wichita","women","wrapped","wyoming",
+    "yesterday","yearly","yields","yorkshire","yugoslavia","zambia","zealand",
+    "zimbabwe","zone"},
+    element(N + 1, List).
+
+-define(CTAG_HOSTNAME,  1).
+-define(CTAG_CTIME,     2).
+-define(CTAG_DESC,      3).
+-define(CTAG_WORDS,     4).
+
+decode_challenge_tag(<<?CTAG_HOSTNAME, Len, Hostname:Len/binary, Rest/binary>>) ->
+    maps:merge(#{hostname => Hostname}, decode_challenge_tag(Rest));
+decode_challenge_tag(<<?CTAG_CTIME, Len, CTime:Len/big-unit:8, Rest/binary>>) ->
+    maps:merge(#{created => CTime}, decode_challenge_tag(Rest));
+decode_challenge_tag(<<?CTAG_DESC, Len, Desc:Len/binary, Rest/binary>>) ->
+    maps:merge(#{description => Desc}, decode_challenge_tag(Rest));
+decode_challenge_tag(<<?CTAG_WORDS, Len, WordsBin:Len/binary, Rest/binary>>) ->
+    Words = [chal_word(N) || <<N>> <= WordsBin],
+    maps:merge(#{words => Words}, decode_challenge_tag(Rest));
+decode_challenge_tag(_) -> #{}.
+
+chal_type_to_atom(1) -> recovery;
+chal_type_to_atom(2) -> verify_audit.
+
+decode_challenge(#ebox_box{unlock_key = {UnlockPt, Curve},
+                           guid = Guid, slot = Slot,
+                           cipher = Cipher, kdf = KDF,
+                           plaintext = Data}) ->
+    <<Version, Type, Id, DestPtLen, DestPt:DestPtLen/binary,
+      EphemPtLen, EphemPt:EphemPtLen/binary,
+      NonceLen, Nonce:NonceLen/binary,
+      IVLen, IV:IVLen/binary,
+      EncLen, Enc:EncLen/binary,
+      TagsBin/binary>> = Data,
+    Tags = decode_challenge_tag(TagsBin),
+    DestKey = {#'ECPoint'{point = DestPt}, Curve},
+    KeyBox = #ebox_box{
+        guid = Guid, slot = Slot,
+        ephemeral_key = {#'ECPoint'{point = EphemPt}, Curve},
+        unlock_key = {UnlockPt, Curve},
+        cipher = Cipher,
+        kdf = KDF,
+        nonce = Nonce,
+        iv = IV,
+        ciphertext = Enc
+    },
+    #ebox_challenge{
+        version = Version,
+        type = chal_type_to_atom(Type),
+        id = Id,
+        description = maps:get(description, Tags, undefined),
+        hostname = maps:get(hostname, Tags, undefined),
+        created = maps:get(created, Tags, undefined),
+        words = maps:get(words, Tags, undefined),
+        destkey = DestKey,
+        keybox = KeyBox
+    }.
+
+-define(RTAG_ID,        1).
+-define(RTAG_KEYPIECE,  2).
+
+response_box(#ebox_challenge{id = Id, destkey = DestKey},
+             #ebox_box{cipher = Cipher, kdf = KDF, plaintext = KeyPiece}) ->
+    Data = <<?RTAG_ID, Id,
+             ?RTAG_KEYPIECE, (byte_size(KeyPiece)), KeyPiece/binary>>,
+    B0 = #ebox_box{
+        cipher = Cipher,
+        kdf = KDF,
+        unlock_key = DestKey,
+        plaintext = Data
+    },
+    encrypt_box(B0).
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -749,11 +856,36 @@ encrypt_box_test() ->
         plaintext = <<"hello world">>,
         unlock_key = PubKey
     },
-    {ok, B1} = encrypt_box(B0),
+    B1 = encrypt_box(B0),
     Data = encode(B1),
     B2 = decode(Data),
     ?assertMatch({ok, #ebox_box{plaintext = <<"hello world">>}},
         decrypt_box(B2, {ebox_key_stdlib, PrivKey})).
 
+decode_chal_test() ->
+    Data = base64:decode(<<
+        "sMUCARAAAAAAAAAAAAAAAAAAAAAAnRFjaGFjaGEyMC1wb2x5MTMwNQZzaGE1MTIQt"
+        "oqfhAOuAff39W7gWYydCghuaXN0cDM4NDEClexz9jRax2zcBJS9YzyHp2FsBcmlp5"
+        "s2z/YnM+d/zX1qZN3Wf44aIryUH6YBoVKIMQOv/ie26CgdbPLYpmTGs/cB2bSucwY"
+        "5byE6Am/aSxEMkj5MyrFLOuEAKxswNdfLoCgAAAABGP/dE6iBWGOGyXo9mGQyUsSA"
+        "iBZPcC4jw4dlBXle1eeNunRZdQaORFuZp1EiGykiZsYx4HV6e5YZWUXWDepIPSR5u"
+        "aqfzS11gH7WY85LcomrevwgnZ4rRmZ13IlqvV2hBQHfjf/ZgZPKVZw957IZpX6Rpt"
+        "3FTm9qUV49/z9l+ISNesPtjQNgfx6hTT9Ms1J086HKnprqIgbqyGvY8WGJeuNDCmb"
+        "Njhoaj74w/uk5iq3unpkTlIOCQIdv8b6tAsDkBTjwKpMeEZfx6Vay06bG7u8gZSQT"
+        "7tl0ole9TcL8n73JqcOyFH67g6Y9LLc0RA8Zs88QubnZB2NSQbs3cVk7PFOiLGAEx"
+        "NSCiwIR0R0pYplDRIpPNRumZVU=">>),
+    B0 = decode(Data),
+    {ok, Pem} = file:read_file("test/testkey.pem"),
+    [PemEntry] = public_key:pem_decode(Pem),
+    PrivKey = public_key:pem_entry_decode(PemEntry),
+    {ok, B1} = decrypt_box(B0, {ebox_key_stdlib, PrivKey}),
+    Chal = decode_challenge(B1),
+    ?assertMatch(#ebox_challenge{type = recovery,
+                                 id = 1,
+                                 hostname = <<"mabel">>}, Chal),
+    #ebox_challenge{keybox = KB0} = Chal,
+    {ok, KB1} = decrypt_box(KB0, {ebox_key_stdlib, PrivKey}),
+    Resp = response_box(Chal, KB1),
+    ?assertMatch(#ebox_box{}, Resp).
 
 -endif.
