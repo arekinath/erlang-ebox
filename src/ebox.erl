@@ -274,12 +274,10 @@ encrypt_box(B0 = #ebox_box{ciphertext = undefined, unlock_key = UnlockKey}) ->
     #'ECPrivateKey'{publicKey = EphemPt} = EphemPriv,
     Nonce = crypto:strong_rand_bytes(16),
     IV = crypto:strong_rand_bytes(IVLen),
-    EphemPoint = ebox_crypto:compress(#'ECPoint'{point = EphemPt}),
-
-    B1 = B0#ebox_box{ephemeral_key = {EphemPoint, UnlockCurve},
+    EphemKey = ebox_crypto:compress({#'ECPoint'{point = EphemPt}, UnlockCurve}),
+    B1 = B0#ebox_box{ephemeral_key = EphemKey,
                      nonce = Nonce,
                      iv = IV},
-
     Padded = pad(Plain, BlockSz),
     DH = public_key:compute_key(UnlockPt, EphemPriv),
     Key = kdf(DH, B1),
@@ -297,11 +295,11 @@ decrypt_box(B0 = #ebox_box{plaintext = undefined}, EboxKey) ->
     {ok, {OurPub, OurCurveT}} = KeyMod:get_public(KeyData),
     UnlockCurve = tup_to_curve(UnlockCurveT),
     OurCurve = tup_to_curve(OurCurveT),
-    OurPoint = ebox_crypto:compress(OurPub),
-    UnlockPoint = ebox_crypto:compress(UnlockPub),
+    {OurPoint,_} = ebox_crypto:compress({OurPub, OurCurveT}),
+    {UnlockPoint,_} = ebox_crypto:compress({UnlockPub, UnlockCurveT}),
     case {UnlockCurve, UnlockPoint} of
         {OurCurve, OurPoint} ->
-            case KeyMod:compute_key(EphemKey, KeyData) of
+            case KeyMod:compute_key(ebox_crypto:compress(EphemKey), KeyData) of
                 {ok, DH} ->
                     #ebox_box{iv = IV, ciphertext = Ciphertext} = B0,
                     Key = kdf(DH, B0),
@@ -762,8 +760,7 @@ tpl_decode_test() ->
         "-----END PUBLIC KEY-----\n">>),
     {PubPoint, Curve} = PubKey,
     OtherPubKey = public_key:pem_entry_decode(PemEntry),
-    {OtherPoint, _OtherCurve} = OtherPubKey,
-    ?assertMatch(PubPoint, ebox_crypto:compress(OtherPoint)),
+    ?assertMatch(PubKey, ebox_crypto:compress(OtherPubKey)),
     TempKey = public_key:generate_key(Curve),
     DHA = public_key:compute_key(element(1,OtherPubKey), TempKey),
     DHB = public_key:compute_key(PubPoint, TempKey),

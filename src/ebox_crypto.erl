@@ -33,20 +33,30 @@
 -export([
     cipher_info/1,
     one_time/4,
-    compress/1
+    compress/1,
+    decompress/1
     ]).
 
-compress(P = #'ECPoint'{point = <<16#02, _/binary>>}) -> P;
-compress(P = #'ECPoint'{point = <<16#03, _/binary>>}) -> P;
-compress(P = #'ECPoint'{point = <<16#04, Rest/binary>>}) ->
-    Half = byte_size(Rest) div 2,
-    <<X:Half/big-unit:8, Y:Half/big-unit:8>> = Rest,
-    case (Y rem 2) of
-        0 ->
-            P#'ECPoint'{point = <<16#02, X:Half/big-unit:8>>};
-        1 ->
-            P#'ECPoint'{point = <<16#03, X:Half/big-unit:8>>}
-    end.
+atomize_curve(?'secp256r1') -> secp256r1;
+atomize_curve(?'secp384r1') -> secp384r1;
+atomize_curve(?'secp521r1') -> secp521r1.
+
+-spec compress(ebox:pubkey()) -> ebox:pubkey().
+compress(K = {#'ECPoint'{point = <<16#02, _/binary>>}, _}) -> K;
+compress(K = {#'ECPoint'{point = <<16#03, _/binary>>}, _}) -> K;
+compress({#'ECPoint'{point = P0}, {namedCurve, Curve}}) when is_atom(Curve) ->
+    P1 = ec_conv_nif:compress(Curve, P0),
+    {#'ECPoint'{point = P1}, {namedCurve, Curve}};
+compress({Pt, {namedCurve, Oid}}) ->
+    compress({Pt, {namedCurve, atomize_curve(Oid)}}).
+
+-spec decompress(ebox:pubkey()) -> ebox:pubkey().
+decompress(K = {#'ECPoint'{point = <<16#04, _/binary>>}, _}) -> K;
+decompress({#'ECPoint'{point = P0}, {namedCurve, Curve}}) when is_atom(Curve) ->
+    P1 = ec_conv_nif:decompress(Curve, P0),
+    {#'ECPoint'{point = P1}, {namedCurve, Curve}};
+decompress({Pt, {namedCurve, Oid}}) ->
+    decompress({Pt, {namedCurve, atomize_curve(Oid)}}).
 
 cipher_info('chacha20-poly1305') ->
     #{block_size => 8, key_len => 64, iv_len => 0, auth_len => 16};
