@@ -1,6 +1,6 @@
 {application, ebox, [
-	{description, "An OTP library"},
-	{vsn, "0.1.0"},
+	{description, "Library for manipulating the pivy ebox file format"},
+	{vsn, "1.0.0"},
 	{registered, []},
 	{applications, [
 		kernel,
