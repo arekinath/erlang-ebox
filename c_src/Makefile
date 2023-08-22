@@ -6,13 +6,13 @@ BASEDIR := $(abspath $(CURDIR)/..)
 PROJECT := ec_conv_nif
 
 ifeq ($(origin ERTS_INCLUDE_DIR), undefined)
-ERTS_INCLUDE_DIR ::= $(shell erl +ssrct -noshell -s init stop -eval "io:format(\"~ts/erts-~ts/include/\", [code:root_dir(), erlang:system_info(version)]).")
+ERTS_INCLUDE_DIR ::= $(shell erl +ssrct -noshell -eval "io:format(\"~ts/erts-~ts/include/\", [code:root_dir(), erlang:system_info(version)]), halt().")
 endif
 ifeq ($(origin ERL_INTERFACE_INCLUDE_DIR), undefined)
-ERL_INTERFACE_INCLUDE_DIR ::= $(shell erl +ssrct -noshell -s init stop -eval "io:format(\"~ts\", [code:lib_dir(erl_interface, include)]).")
+ERL_INTERFACE_INCLUDE_DIR ::= $(shell erl +ssrct -noshell -eval "io:format(\"~ts\", [code:lib_dir(erl_interface, include)]), halt().")
 endif
 ifeq ($(origin ERL_INTERFACE_LIB_DIR), undefined)
-ERL_INTERFACE_LIB_DIR ::= $(shell erl +ssrct -noshell -s init stop -eval "io:format(\"~ts\", [code:lib_dir(erl_interface, lib)]).")
+ERL_INTERFACE_LIB_DIR ::= $(shell erl +ssrct -noshell -eval "io:format(\"~ts\", [code:lib_dir(erl_interface, lib)]), halt().")
 endif
 
 C_SRC_DIR = $(CURDIR)
