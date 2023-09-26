@@ -1,6 +1,6 @@
 {application, ebox, [
 	{description, "Library for manipulating the pivy ebox file format"},
-	{vsn, "1.0.0"},
+	{vsn, "1.0.1"},
 	{registered, []},
 	{applications, [
 		kernel,
